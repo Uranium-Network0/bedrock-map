@@ -1,11 +1,12 @@
-name = "bedrock-live-map"
+name = "bedrock-map"
 main = "src/worker.js"
-compatibility_date = "2026-01-01"
+compatibility_date = "2024-04-05" # You can keep whatever date is currently in your file
 
 [[durable_objects.bindings]]
 name = "WORLD_MAP"
 class_name = "WorldMapState"
 
+# Add this block to enable Durable Objects on the Free plan
 [[migrations]]
 tag = "v1"
-new_classes = ["WorldMapState"]
+new_sqlite_classes = ["WorldMapState"]
