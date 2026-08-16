@@ -1,97 +1,136 @@
+import { DurableObject } from "cloudflare:workers";
 
-import express from "express";
-import { WebSocketServer } from "ws";
-import http from "http";
+// Durable Object: holds the current world/build state in memory + storage,
+// accepts updates from the Bedrock server, and broadcasts to connected
+// browser clients over WebSocket.
+export class WorldMapState extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.state = ctx;
+    this.env = env;
+    this.sessions = [];
+    this.blocks = new Map();  // key: "dim:x:y:z" -> {x,y,z,dimension,type}
+    this.players = new Map(); // key: name -> {name,x,y,z,dimension}
 
-const app = express();
-app.use(express.json({ limit: "5mb" }));
-
-const API_KEY = process.env.BEDROCK_API_KEY;
-
-// In-memory world state
-const blocks = new Map();  // key: "dim:x:y:z" -> {x,y,z,dimension,type}
-const players = new Map(); // key: name -> {name,x,y,z,dimension}
-
-// --- HTTP endpoints ---
-
-// One-off snapshot, useful for the initial page load
-app.get("/state", (req, res) => {
-  res.json({
-    blocks: Array.from(blocks.values()),
-    players: Array.from(players.values()),
-  });
-});
-
-// Bedrock server posts block/player updates here
-app.post("/update", (req, res) => {
-  const key = req.headers["x-api-key"];
-  if (!API_KEY || key !== API_KEY) {
-    return res.status(401).send("Unauthorized");
+    // Restore persisted blocks on cold start
+    this.state.blockConcurrencyWhile(async () => {
+      const stored = await this.state.storage.get("blocks");
+      if (stored) this.blocks = new Map(stored);
+    });
   }
 
-  const payload = req.body || {};
-  const changedBlocks = [];
+  async fetch(request) {
+    const url = new URL(request.url);
 
-  if (Array.isArray(payload.blocks)) {
-    for (const b of payload.blocks) {
-      if (
-        typeof b.x !== "number" || typeof b.y !== "number" ||
-        typeof b.z !== "number" || typeof b.type !== "string"
-      ) continue;
-
-      const dim = b.dimension || "overworld";
-      const mapKey = `${dim}:${b.x}:${b.y}:${b.z}`;
-
-      if (b.type === "minecraft:air") {
-        blocks.delete(mapKey);
-      } else {
-        blocks.set(mapKey, { x: b.x, y: b.y, z: b.z, dimension: dim, type: b.type });
-      }
-      changedBlocks.push({ x: b.x, y: b.y, z: b.z, dimension: dim, type: b.type });
+    if (url.pathname === "/ws") return this.handleWebSocket(request);
+    if (url.pathname === "/update" && request.method === "POST") {
+      return this.handleUpdate(request);
     }
-  }
-
-  if (Array.isArray(payload.players)) {
-    for (const p of payload.players) {
-      if (!p.name) continue;
-      players.set(p.name, {
-        name: p.name, x: p.x, y: p.y, z: p.z, dimension: p.dimension || "overworld",
+    if (url.pathname === "/state" && request.method === "GET") {
+      return Response.json({
+        blocks: Array.from(this.blocks.values()),
+        players: Array.from(this.players.values()),
       });
     }
+
+    return new Response("Not found", { status: 404 });
   }
 
-  broadcast({ type: "delta", blocks: changedBlocks, players: payload.players || [] });
-  res.send("OK");
-});
+  handleWebSocket(request) {
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    server.accept();
+    this.sessions.push(server);
 
-app.get("/", (req, res) => {
-  res.send("Bedrock live map backend is running.");
-});
+    // Send full current state to the newly connected browser
+    server.send(JSON.stringify({
+      type: "snapshot",
+      blocks: Array.from(this.blocks.values()),
+      players: Array.from(this.players.values()),
+    }));
 
-// --- WebSocket ---
+    const drop = () => {
+      this.sessions = this.sessions.filter((s) => s !== server);
+    };
+    server.addEventListener("close", drop);
+    server.addEventListener("error", drop);
 
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: "/ws" });
+    return new Response(null, { status: 101, webSocket: client });
+  }
 
-wss.on("connection", (ws) => {
-  // Send full current state to the newly connected browser
-  ws.send(JSON.stringify({
-    type: "snapshot",
-    blocks: Array.from(blocks.values()),
-    players: Array.from(players.values()),
-  }));
-});
-
-function broadcast(message) {
-  const data = JSON.stringify(message);
-  for (const client of wss.clients) {
-    if (client.readyState === client.OPEN) {
-      client.send(data);
+  async handleUpdate(request) {
+    // Simple shared-secret auth so randoms can't poison your map data
+    const key = request.headers.get("x-api-key");
+    if (!this.env.BEDROCK_API_KEY || key !== this.env.BEDROCK_API_KEY) {
+      return new Response("Unauthorized", { status: 401 });
     }
+
+    let payload;
+    try {
+      payload = await request.json();
+    } catch {
+      return new Response("Bad JSON", { status: 400 });
+    }
+
+    const changedBlocks = [];
+
+    if (Array.isArray(payload.blocks)) {
+      for (const b of payload.blocks) {
+        if (
+          typeof b.x !== "number" || typeof b.y !== "number" ||
+          typeof b.z !== "number" || typeof b.type !== "string"
+        ) continue;
+
+        const dim = b.dimension || "overworld";
+        const mapKey = `${dim}:${b.x}:${b.y}:${b.z}`;
+
+        if (b.type === "minecraft:air") {
+          this.blocks.delete(mapKey);
+        } else {
+          this.blocks.set(mapKey, { x: b.x, y: b.y, z: b.z, dimension: dim, type: b.type });
+        }
+        changedBlocks.push({ x: b.x, y: b.y, z: b.z, dimension: dim, type: b.type });
+      }
+      // Persist without blocking the response/broadcast
+      this.state.storage.put("blocks", Array.from(this.blocks.entries()));
+    }
+
+    if (Array.isArray(payload.players)) {
+      for (const p of payload.players) {
+        if (!p.name) continue;
+        this.players.set(p.name, {
+          name: p.name, x: p.x, y: p.y, z: p.z, dimension: p.dimension || "overworld",
+        });
+      }
+    }
+
+    this.broadcast({
+      type: "delta",
+      blocks: changedBlocks,
+      players: payload.players || [],
+    });
+
+    return new Response("OK");
+  }
+
+  broadcast(message) {
+    const data = JSON.stringify(message);
+    this.sessions = this.sessions.filter((session) => {
+      try {
+        session.send(data);
+        return true;
+      } catch {
+        return false;
+      }
+    });
   }
 }
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Listening on port ${PORT}`);
-});
+// Router: everything goes to a single Durable Object instance named "main-map"
+export default {
+  async fetch(request, env) {
+    const id = env.WORLD_MAP.idFromName("main-map");
+    const stub = env.WORLD_MAP.get(id);
+    return stub.fetch(request);
+  },
+};
